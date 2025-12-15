@@ -1,0 +1,139 @@
+name: CI
+
+on:
+  push:
+    # run for all branches (jobs selectively run by `if:` where needed)
+    branches:
+      - "**"
+  pull_request:
+    branches:
+      - "**"
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.11"
+  VENV_DIR: venv
+  REQUIREMENTS: requirements.txt
+  # default GCR registry — override with env or secrets if needed
+  GCR_HOSTNAME: "gcr.io"
+
+jobs:
+  build:
+    name: Build, test & linters
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Cache venv and pip cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.VENV_DIR }}
+            ~/.cache/pip
+          # mirrors CircleCI cache-key behavior: include branch and checksum of requirements
+          key: venv-${{ github.ref_name }}-${{ runner.os }}-${{ hashFiles(env.REQUIREMENTS) }}
+          restore-keys: |
+            venv-${{ github.ref_name }}-${{ runner.os }}-
+            venv-${{ runner.os }}-
+
+      - name: Create venv & install dependencies
+        run: |
+          python -m venv ${{ env.VENV_DIR }}
+          # ensure pip is up to date
+          ${{ env.VENV_DIR }}/bin/pip install --upgrade pip setuptools wheel
+          ${{ env.VENV_DIR }}/bin/pip install --progress-bar off --upgrade -r ${{ env.REQUIREMENTS }}
+
+      - name: PyTest
+        run: ${{ env.VENV_DIR }}/bin/pytest --black --ignore=auto_sizing/tests/integration/
+      
+      - name: flake8
+        run: ${{ env.VENV_DIR }}/bin/flake8 auto_sizing
+
+      - name: isort (check)
+        run: ${{ env.VENV_DIR }}/bin/isort --check auto_sizing
+
+      - name: Mypy
+        run: ${{ env.VENV_DIR }}/bin/mypy auto_sizing
+
+  build_docker:
+    name: Build Docker image (branches except main)
+    runs-on: ubuntu-latest
+    # CircleCI had build_docker ignored for main — mirror that:
+    if: github.ref != 'refs/heads/main'
+    needs: []
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU (for cross-platform build support)
+        uses: docker/setup-qemu-action@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Build Docker image
+        # we don't push here, only build as in CircleCI; using buildx to make it efficient
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          push: false
+          tags: auto-sizing-test:latest
+          # --no-cache equivalent
+          build-args: |
+            NO_CACHE=true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  build_and_push_image:
+    name: Build & push image to GCR (only on main)
+    runs-on: ubuntu-latest
+    needs: build
+    # run only when pushing to main (matches your CircleCI filters)
+    if: github.ref == 'refs/heads/main'
+    env:
+      # set via repository secrets or override here if desired
+      GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
+      GCR_IMAGE: ${{ secrets.GCR_IMAGE || 'auto_sizing' }}
+      GCR_HOSTNAME: ${{ env.GCR_HOSTNAME }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure Google Cloud credentials
+        # Expects a service account JSON key in the repo secret GCP_SA_KEY
+        # Create a secret named GCP_SA_KEY with the JSON contents.
+        uses: google-github-actions/auth@v1
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Configure Docker auth for GCR
+        # authenticates docker to GCR using google-github-actions/auth credentials
+        run: |
+          gcloud auth configure-docker --quiet
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Build and push image to GCR
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.GCR_HOSTNAME }}/${{ env.GCP_PROJECT }}/${{ env.GCR_IMAGE }}:latest
+            ${{ env.GCR_HOSTNAME }}/${{ env.GCP_PROJECT }}/${{ env.GCR_IMAGE }}:${{ github.sha }}
+          cache-from: type=registry,ref=${{ env.GCR_HOSTNAME }}/${{ env.GCP_PROJECT }}/${{ env.GCR_IMAGE }}:cache
+          cache-to: type=inline
+
+      - name: Echo pushed image refs
+        run: |
+          echo "Pushed: ${{ env.GCR_HOSTNAME }}/${{ env.GCP_PROJECT }}/${{ env.GCR_IMAGE }}:latest"
+          echo "Immutable tag: ${{ env.GCR_HOSTNAME }}/${{ env.GCP_PROJECT }}/${{ env.GCR_IMAGE }}:${{ github.sha }}"
